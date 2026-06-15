@@ -1,30 +1,4 @@
-"""
-inference.py — GNN-guided gate-level extraction over a whole cell library.
 
-Mirrors VF3's interface: given a circuit and a full standard-cell library, produce
-the complete gate-level netlist (every gate type), but layered with GNN region
-prediction so each extracted instance carries the model's confidence.
-
-Pipeline (paper Sec III-D):
-  - Exact matching (VF3)   : extract every gate instance.       <-- TIMED (matching)
-  - GNN region prediction  : score the K-hop region of each      <-- TIMED (inference)
-                             found gate type and annotate each instance.
-
-ONLY those two phases are timed. Netlist parsing, library splitting, model loading
-and Verilog writing are setup and are excluded — they are not what we measure. The
-matching time is VF3's own reported compute runtime, so even VF3's file I/O is out.
-
-Efficiency: the candidate K-hop region embeddings do not depend on the target gate,
-so they are encoded ONCE per distinct K-radius and shared across every gate sharing
-that K. Only the cheap MLP head re-runs per gate type.
-
-Output: a VF3-style Verilog netlist (all gate types) written to outputs/<circuit>.v,
-each instance annotated with its region-prediction probability.
-
-Usage:
-    python src/inference.py --circuit C432
-    python src/inference.py --circuit C432 --lib vf3_cpp/examples/lib/libc432.sp
-"""
 import argparse
 import contextlib
 import io
@@ -105,11 +79,54 @@ def vf3_match(vf3_bin, lib_sp, circuit_sp, out_v):
 
 # ── phase 2: GNN region prediction (TIMED) ───────────────────────────────────
 @torch.no_grad()
+def score_matches(model, full_graph, targets, instances, bare_to_id, batch_size=256):
+    """
+    Default fast path: the output only reads GNN scores at matched transistors, so
+    encode ONLY those regions. Region encoding depends only on K (not the target),
+    so group the needed centers by K and encode in big batches, then score per
+    gate. Output is identical to a full scan. Returns {gate: {center_id: prob}}.
+    """
+    needed = defaultdict(set)
+    for gate, fets, _ in instances:
+        if gate not in targets:
+            continue
+        for f in fets:
+            if f.lower() in bare_to_id:
+                needed[gate].add(bare_to_id[f.lower()])
+
+    centers_by_k = defaultdict(set)
+    for gate, centers in needed.items():
+        centers_by_k[targets[gate][1]] |= centers
+
+    hcand = {}                                                    # (k, center) -> embedding
+    for k, centers in centers_by_k.items():
+        centers = sorted(centers)
+        embs = []
+        for start in range(0, len(centers), batch_size):
+            chunk = centers[start:start + batch_size]
+            regions = [_extract_subgraph(full_graph, int(c), k) for c in chunk]
+            embs.append(model.encode(Batch.from_data_list(regions)))
+        H = torch.cat(embs, dim=0)
+        for i, c in enumerate(centers):
+            hcand[(k, c)] = H[i]
+
+    scores = {}
+    for gate, centers in needed.items():
+        k = targets[gate][1]
+        cs = sorted(centers)
+        H = torch.stack([hcand[(k, c)] for c in cs], dim=0)       # [m, D]
+        h_t = model.encode(Batch.from_data_list([targets[gate][0]]))
+        p = torch.sigmoid(model.mlp(torch.cat([H, h_t.expand(H.size(0), -1)], dim=1))).squeeze(1)
+        scores[gate] = {c: float(p[i]) for i, c in enumerate(cs)}
+    return scores
+
+
+@torch.no_grad()
 def predict_regions(model, full_graph, targets, gate_types, centers, batch_size=256):
     """
-    Score the K-hop region of every center for each gate type in `gate_types`.
-    Candidate-region encodings are computed once per distinct K and shared across
-    all gates with that K. Returns {gate: {center_id: prob}}.
+    Full region prediction (--scan-all): score the K-hop region of every center
+    for each gate type. Candidate-region encodings are computed once per distinct
+    K and shared across all gates with that K. Returns {gate: {center_id: prob}}.
     """
     gates_by_k = defaultdict(list)
     for g in gate_types:
@@ -162,7 +179,10 @@ def main():
     ap.add_argument("--config", default=str(_ROOT / "configs" / "config.yaml"))
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--output", default=str(_ROOT / "outputs"))
-    ap.add_argument("--centers", choices=["all", "transistors"], default="all")
+    ap.add_argument("--centers", choices=["all", "transistors"], default="all",
+                    help="centers for --scan-all region prediction (paper: all)")
+    ap.add_argument("--scan-all", action="store_true",
+                    help="full region prediction over every node (slower); default scores only matched regions")
     ap.add_argument("--batch-size", type=int, default=256)
     args = ap.parse_args()
 
@@ -189,11 +209,7 @@ def main():
     circuit_dict = parse_spice_dict(Path(circuit_sp).read_text(errors="replace"))
     full_graph = _build_full_graph(circuit_dict)
     targets = build_targets(Path(lib_sp).read_text(errors="replace"), ke["k_hops"])
-
-    if args.centers == "transistors":
-        centers = (full_graph.node_types >= 3).nonzero(as_tuple=True)[0].tolist()
-    else:
-        centers = list(range(full_graph.num_nodes))
+    bare_to_id = bare_name_to_id(circuit_dict)
 
     # ── PHASE 1 — VF3 exact matching (TIMED) ─────────────────────────────────
     t1 = time.perf_counter()
@@ -205,11 +221,19 @@ def main():
 
     # ── PHASE 2 — GNN region prediction (TIMED) ──────────────────────────────
     t0 = time.perf_counter()
-    scores = predict_regions(model, full_graph, targets, found_gates, centers, args.batch_size)
+    if args.scan_all:
+        if args.centers == "transistors":
+            centers = (full_graph.node_types >= 3).nonzero(as_tuple=True)[0].tolist()
+        else:
+            centers = list(range(full_graph.num_nodes))
+        scores = predict_regions(model, full_graph, targets, found_gates, centers, args.batch_size)
+        n_regions = f"{len(found_gates)} gate types x {len(centers)} regions"
+    else:
+        scores = score_matches(model, full_graph, targets, instances, bare_to_id, args.batch_size)
+        n_regions = f"{sum(len(g) for g in scores.values())} matched regions"
     t_infer = time.perf_counter() - t0
 
     # ── ASSEMBLE OUTPUT (untimed) — preserve VF3 order, annotate p_hat ────────
-    bare_to_id = bare_name_to_id(circuit_dict)
     annotated = []
     for gate, fets, inst_line in instances:
         ids = [bare_to_id[f.lower()] for f in fets if f.lower() in bare_to_id]
@@ -225,8 +249,7 @@ def main():
     print(f"\n{sep}")
     print(f"  {circuit_name}  ←  library {lib_sp.name}")
     print(sep)
-    print(f"  Inference  (GNN region prediction) : {t_infer:.6f} s   "
-          f"[{len(found_gates)} gate types, {len(centers)} regions each]")
+    print(f"  Inference  (GNN region scoring)    : {t_infer:.6f} s   [{n_regions}]")
     print(f"  Exact match (VF3)                  : {t_match:.6f} s")
     print(f"  ──────────────────────────────────────────────────")
     print(f"  Total (inference + matching)       : {t_infer + t_match:.6f} s")
