@@ -4,29 +4,19 @@ import os
 import sys
 from pathlib import Path
 
-# ── Project layout ────────────────────────────────────────────────────────────
-# src/parser.py  →  parent = src/  →  parent.parent = circuit_gnn_project/
-_SRC_DIR     = Path(__file__).resolve().parent          # .../circuit_gnn_project/src
-_PROJECT_DIR = _SRC_DIR.parent                          # .../circuit_gnn_project
+_SRC_DIR     = Path(__file__).resolve().parent
+_PROJECT_DIR = _SRC_DIR.parent
 
-RAW_DIR    = _PROJECT_DIR / "data" / "raw"              # drop .sp files here
-PARSED_DIR = _PROJECT_DIR / "data" / "parsed"           # JSONs written here
+RAW_DIR    = _PROJECT_DIR / "data" / "raw"
+PARSED_DIR = _PROJECT_DIR / "data" / "parsed"
 
-# ── Power/Ground allowlists ───────────────────────────────────────────────────
-# Covers both bare names (user SPICEs) and exclamation-mark globals (repo SPICEs)
 KNOWN_VDD = {'vdd', 'vcc', 'pwr', 'avdd', 'dvdd', 'vdd!', 'vddh!', 'vbb!', 'vddh2!'}
 KNOWN_GND = {'gnd', 'vss', 'agnd', '0', 'gnd!'}
 
-# Repo-compliant signal types allowed to have reverse edges (MOSFET -> Net)
 SIGNAL_TYPES = {2}
 
 def classify_net(net_name: str) -> int:
-    """
-    Returns the repo-compliant node type for a net:
-      0 = VDD / power rail
-      1 = GND / ground rail
-      2 = standard signal wire
-    """
+
     clean = net_name.strip().lower()
     if clean in KNOWN_VDD:
         return 0
@@ -34,34 +24,22 @@ def classify_net(net_name: str) -> int:
         return 1
     return 2
 
-
 def classify_mosfet(model_name: str):
-    """
-    Returns (node_type, is_unknown):
-      node_type 8 = PMOS  (repo convention)
-      node_type 9 = NMOS  (repo convention)
-      is_unknown  = True when the model string matched nothing known
-    """
+
     m = model_name.lower()
     if any(k in m for k in ['pmos', 'pfet', 'p_mos', 'pch']):
         return 8, False
     if any(k in m for k in ['nmos', 'nfet', 'n_mos', 'nch']):
         return 9, False
 
-    # PDK node-size convention: digit immediately before a lone p/n
     hit = _PDK_PAT.search(m)
     if hit:
         return (8, False) if hit.group(1) == 'p' else (9, False)
 
-    # Unknown: default to NMOS and surface the problem to the caller
     return 9, True
 
-
 def scale_spice_unit(val_str: str):
-    """
-    Converts a SPICE dimension string (e.g. '1u', '180n', '2.5e-6') to metres.
-    Returns None if val_str is empty or cannot be parsed.
-    """
+
     if not val_str:
         return None
     m = re.match(r'^([\d\.\+\-eE]+)([a-zA-Z]*)', val_str.strip())
@@ -84,8 +62,6 @@ def scale_spice_unit(val_str: str):
     scale = suffix_map.get(suffix_lower[0], 1.0) if suffix_lower else 1.0
     return base_val * scale
 
-
-# ── SPICE dimension regex helpers ─────────────────────────────────────────────
 _W_PAT = re.compile(r'(?<!\w)w\s*=\s*([\d\.eE\+\-]+[a-zA-Z]*)', re.IGNORECASE)
 _L_PAT = re.compile(r'(?<!\w)l\s*=\s*([\d\.eE\+\-]+[a-zA-Z]*)', re.IGNORECASE)
 _PDK_PAT = re.compile(r'(?<=\d)([pn])(?=\d|\b)', re.IGNORECASE)
@@ -94,16 +70,12 @@ _MOS_PAT = re.compile(
     re.IGNORECASE,
 )
 
-# SPICE element prefixes that are handled with explicit warnings
 _PASSIVE_CHARS   = frozenset('RCL')
-_UNHANDLED_CHARS = frozenset('XVIEFGH')
 
+_UNHANDLED_CHARS = frozenset('VIEFGH')
 
 def _resolve_logical_lines(raw_text: str):
-    """
-    Strips comments and joins continuation lines (lines starting with '+').
-    Returns a list of complete logical SPICE statements.
-    """
+
     logical_lines = []
     current = ""
     for raw_line in raw_text.splitlines():
@@ -120,15 +92,8 @@ def _resolve_logical_lines(raw_text: str):
         logical_lines.append(current)
     return logical_lines
 
-
 def split_library_into_subckts(raw_text: str) -> dict:
-    """
-    Split a shared SPICE library into one self-contained text block per .SUBCKT.
-    Used for the TARGET gate library; each block keeps its own .SUBCKT/.ENDS wrapper
-    so the normal parser yields a single connected gate graph. Nested subckts are
-    rejected (gate templates are expected to be flat transistor netlists).
-    Returns {subckt_name: block_text}.
-    """
+
     blocks = {}
     current_name = None
     depth = 0
@@ -152,12 +117,8 @@ def split_library_into_subckts(raw_text: str) -> dict:
             blocks[current_name].append(line)
     return {name: "\n".join(lines) for name, lines in blocks.items()}
 
-
 def parse_target_library(library_path: Path, out_dir: Path) -> list:
-    """
-    Parse every .SUBCKT in a gate library into its own <name>.json under out_dir.
-    These JSONs are the target graphs G_T the extractor/model condition on.
-    """
+
     with open(library_path, 'r') as f:
         text = f.read()
     blocks = split_library_into_subckts(text)
@@ -173,8 +134,6 @@ def parse_target_library(library_path: Path, out_dir: Path) -> list:
     print(f"  Targets: {', '.join(written)}\n")
     return written
 
-
-
 def parse_spice_to_heterogeneous_graph(
     spice_text: str,
     output_filename: str,
@@ -188,6 +147,8 @@ def parse_spice_to_heterogeneous_graph(
     current_scope     = "TOP"
     seen_names        = set()
     unknown_model_log = []
+    dropped_subckt_insts = 0
+    dropped_diodes       = 0
 
     for line in logical_lines:
         if not line:
@@ -195,7 +156,6 @@ def parse_spice_to_heterogeneous_graph(
 
         first_upper = line[0].upper()
 
-        # ── Scope directives ─────────────────────────────────────────────────
         lower = line.lower()
         if lower.startswith('.subckt'):
             parts = line.split()
@@ -211,7 +171,6 @@ def parse_spice_to_heterogeneous_graph(
         if lower.startswith('.'):
             continue
 
-        # ── MOSFET ───────────────────────────────────────────────────────────
         mos_m = _MOS_PAT.match(line)
         if mos_m:
             raw_name  = mos_m.group(1).upper()
@@ -297,7 +256,15 @@ def parse_spice_to_heterogeneous_graph(
             })
             continue
 
-        # ── Passives & Unhandled ─────────────────────────────────────────────
+        if first_upper == 'X':
+            dropped_subckt_insts += 1
+            continue
+
+        if first_upper == 'D':
+            dropped_diodes += 1
+            print(f"[WARN] Diode skipped (D-line): {line[:80]}")
+            continue
+
         if first_upper in _PASSIVE_CHARS:
             print(f"[WARN] Passive component skipped: {line[:80]}")
             continue
@@ -306,7 +273,6 @@ def parse_spice_to_heterogeneous_graph(
             print(f"[WARN] Unhandled element skipped ({first_upper}-line): {line[:80]}")
             continue
 
-    # ── Node assignment ───────────────────────────────────────────────────────
     node_name_to_id = {}
     id_to_node_name = {}
     node_types      = []
@@ -331,7 +297,6 @@ def parse_spice_to_heterogeneous_graph(
         }
         node_counter += 1
 
-    # ── Edge construction ─────────────────────────────────────────────────────
     source_edges = []
     target_edges = []
     edge_types   = []
@@ -345,18 +310,15 @@ def parse_spice_to_heterogeneous_graph(
             net_type = node_types[net_id]
             fwd_type = base_offset + pin_idx
 
-            # Forward Edge (Net -> Cell)
             source_edges.append(net_id)
             target_edges.append(mos_id)
             edge_types.append(fwd_type)
 
-            # Reverse Edge (Cell -> Net) using explicit set checking
             if net_type in SIGNAL_TYPES:
                 source_edges.append(mos_id)
                 target_edges.append(net_id)
                 edge_types.append(fwd_type + 14)
 
-    # ── Assemble output dict ──────────────────────────────────────────────────
     pyg_data = {
         "num_nodes":       node_counter,
         "node_type":       node_types,
@@ -369,7 +331,6 @@ def parse_spice_to_heterogeneous_graph(
     if unknown_model_log:
         pyg_data["unknown_models"] = unknown_model_log
 
-    # Ensure output directory exists (data/parsed/ may not exist yet on first run)
     Path(output_filename).parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -379,7 +340,6 @@ def parse_spice_to_heterogeneous_graph(
         print(f"[ERROR] Failed writing to '{output_filename}': {e}")
         sys.exit(1)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     n_nets = len(unique_nets)
     n_mos  = len(parsed_mosfets)
 
@@ -397,12 +357,21 @@ def parse_spice_to_heterogeneous_graph(
     print(f"  Nets   :          signal={n_sig}  VDD={n_pwr}  GND={n_gnd}")
     print(f"  MOS    :          PMOS={n_pmos}  NMOS={n_nmos}")
     print(f"  Edges  : {len(edge_types):>5}   directed")
+    if dropped_diodes:
+        print(f"  [!] {dropped_diodes} diode(s) (D-lines) dropped — not in graph")
     if unknown_model_log:
         print(f"  [!] {len(unknown_model_log)} unknown model(s) — see 'unknown_models' in JSON")
-    print(f"{sep}\n")
+    print(f"{sep}")
+
+    if dropped_subckt_insts:
+        print(f"\n[CRITICAL] {dropped_subckt_insts} subcircuit instantiation(s) (X-lines) were dropped.")
+        print(f"           This parser does NOT flatten hierarchy, so the circuit connectivity")
+        print(f"           defined by those instances is ABSENT from the output graph — the graph")
+        print(f"           is INCOMPLETE and almost certainly does not represent this circuit.")
+        print(f"           Flatten the netlist before parsing, or restrict to flat (transistor-")
+        print(f"           level) netlists. Output written anyway for inspection only.\n")
 
     return pyg_data
-
 
 if __name__ == "__main__":
     import argparse
@@ -415,7 +384,6 @@ if __name__ == "__main__":
                     help="output dir for --library targets (default: data/parsed/targets)")
     args = ap.parse_args()
 
-    # ── Target library mode ───────────────────────────────────────────────────
     if args.library:
         lib_path = Path(args.library)
         if not lib_path.is_file():
@@ -425,8 +393,6 @@ if __name__ == "__main__":
         parse_target_library(lib_path, targets_dir)
         sys.exit(0)
 
-    # ── Entire-circuit mode (original behaviour) ──────────────────────────────
-    if not args.stem:
         print("Usage: python src/parser.py <stem>")
         print("       python src/parser.py <input.sp> <output.json>")
         print("       python src/parser.py --library <gates.sp> [--targets-dir DIR]")

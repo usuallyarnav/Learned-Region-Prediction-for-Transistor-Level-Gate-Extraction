@@ -1,103 +1,48 @@
-# config.yaml — Pipeline Hyperparameters
-# Single source of truth for all scripts. Pass via --config flag.
-
-# ── Data ────────────────────────────────────────────────────────────────────
 data:
-  raw_dir:      data/raw/          # Original SPICE netlists (.sp)
-  parsed_dir:   data/parsed/       # Parser output JSONs (entire ISCAS-85 circuits)
-  targets_dir:  data/parsed/targets/  # Per-gate target graphs (parser.py --library)
-  dataset_dir:  data/dataset/      # Extracted .pt subgraph files
+  raw_dir:      data/raw/
+  parsed_dir:   data/parsed/
+  targets_dir:  data/parsed/targets/
+  dataset_dir:  data/dataset/
   train_split:  0.7
   val_split:    0.15
   test_split:   0.15
-
-# ── Subgraph Extraction ──────────────────────────────────────────────────────
 extractor:
-  k_hops:             3            # Receptive field depth.
-                                   # Paper sets K = radius(G_T) per target (Sec III-B).
-                                   # 3 is a fixed upper bound used here as a practical default.
+  k_hops:             3
   seed:               42
-  max_pos_per_target: 200         # paper cap; seeded RANDOM subset per circuit,gate. null = keep ALL VF3 instances.
-
-  # ── VF3 matcher (gate extraction engine) ──────────────────────────────
-  vf3_bin: vf3_cpp/build/prog          # built C++ binary (cd vf3_cpp && make)
-  lib_dir: vf3_cpp/examples/lib        # per-circuit libs: lib<circuit>.sp
-                                   # Was 200 for speed with networkx VF2; with VF3-parallel
-                                   # leave null so positive coverage isn't truncated.
-
-  # ── Negative-sample composition (per positive sample) ─────────────────────
-  # Paper protocol (Sec IV — Evaluation Protocol), per target circuit:
-  #   200 positive / 100 partial / 50 mutation / 50 others / 300 random
-  #   → per-positive ratios:  partial 0.50,  mutation 0.25,  others 0.25,  random 1.50
-  #
-  # IMPORTANT — hard negatives (Partial + Mutation):
-  #   The previous setup hardcoded 1 partial + 2 mutation per positive, i.e.
-  #   partial:mutation = 1:2.  The paper uses 100:50 = 2:1 (Partial is the STRONGER
-  #   hard negative — see ablation Fig. 4). The values below restore the paper's 2:1
-  #   ratio so Partial is no longer under-represented.
-  #
-  # NOTE: extractor.py must read these keys. If your extractor still reads the old
-  #       `neg_pos_ratio` knob, update it to consume the `negatives:` block below
-  #       (random_per_pos replaces neg_pos_ratio one-for-one).
+  max_pos_per_target: 200
+  vf3_bin: vf3_cpp/build/prog
+  lib_dir: vf3_cpp/examples/lib
   negatives:
-    random_per_pos:    1.5         # easy negatives  (paper 300/200)
-    partial_per_pos:   0.5         # HARD negative — partial containment / topology distortion (paper 100/200)
-    mutation_per_pos:  0.25        # HARD negative — PMOS/NMOS swap + source/drain swap (paper 50/200)
-    others_per_pos:    0.25        # confusable-gate negative: a region containing a DIFFERENT
-                                   # target gate found in the same circuit (paper 50/200).
-  # Total negatives per positive at paper ratios: 2.5  →  hard fraction = 0.75/2.5 = 30%.
-
-  # Back-compat shim: kept so an un-updated extractor.py still runs. If your extractor
-  # reads `negatives:` above, this is ignored. Mirrors negatives.random_per_pos.
-  neg_pos_ratio:      2            # (was 3) random negatives per positive
-
-# ── Model ────────────────────────────────────────────────────────────────────
+    random_per_pos:    1.5
+    partial_per_pos:   0.5
+    mutation_per_pos:  0.25
+    others_per_pos:    0.25
+  neg_pos_ratio:      2
 model:
-  in_channels:        5            # One-hot node types (VDD, GND, Sig, PMOS, NMOS)
-  hidden_channels:    128          # RGCN embedding width
-  num_relations:      22           # Static pipeline constant — do NOT change
+  in_channels:        5
+  hidden_channels:    128
+  num_relations:      22
   num_bases:          8
-  num_layers:         2            # L in the paper (Evaluation Protocol). All-hop concat uses l=0..L.
-
-# ── Training ─────────────────────────────────────────────────────────────────
+  num_layers:         2
 training:
-  epochs:         1000             # Paper protocol (Section IV Evaluation Protocol)
+  epochs:         1000
   batch_size:     64
   learning_rate:  0.001
   weight_decay:   0.0001
-  # Best-checkpoint / scheduler / early-stop metric: "f1" (balanced, default) or
-  # "recall". Switch to recall if the run is MISSING gates — the exact VF3 verifier
-  # downstream discards any false positives the filter lets through, so keeping too
-  # many regions is cheap, but a missed region is a permanently missed gate.
   checkpoint_metric: f1
-  # pos_weight controls the BCEWithLogitsLoss class-imbalance penalty.
-  # Priority: explicit value here → used directly.
-  #           Commented out / null → computed dynamically as neg_count / pos_count.
-  # At the paper's 2.5:1 natural ratio, dynamic gives ~2.5 — recommended for first run.
-  # Uncomment and set a higher value only if recall on positives collapses.
-  # pos_weight: 5
-
-  # ── Anti-plateau schedule ─────────────────────────────────────────────────
-  # These do NOT change the modelling strategy (still RGCN + BCE, exactly as the
-  # paper). They only govern how the learning rate moves and when to stop, which is
-  # what breaks the flat-loss / flat-F1 plateaus seen with a constant LR over 1000 epochs.
-  grad_clip_norm:   1.0            # max global grad norm; null/0 disables. Stabilises RGCN steps.
-  warmup_epochs:    5              # linear LR ramp 0→learning_rate over these epochs (0 disables)
-
+  grad_clip_norm:   1.0
+  warmup_epochs:    5
   scheduler:
     enabled:        true
-    type:           plateau        # ReduceLROnPlateau on val_f1 (mode=max)
-    factor:         0.5            # LR ← LR * factor when val_f1 stalls
-    patience:       15             # epochs with no val_f1 improvement before an LR drop
-    min_lr:         0.00001        # floor; below this further drops are pointless
-    threshold:      0.001          # min val_f1 gain to count as "improvement"
-
+    type:           plateau
+    factor:         0.5
+    patience:       15
+    min_lr:         0.00001
+    threshold:      0.001
   early_stopping:
     enabled:        true
-    patience:       60             # stop if no val_f1 improvement for this many epochs
-    min_delta:      0.0005         # improvement smaller than this does not reset the counter
-
-# ── Inference ────────────────────────────────────────────────────────────────
+    patience:       60
+    min_delta:      0.0005
 inference:
-  vf3_threshold:      0.90         # Lowered from 0.95 — calibrated for 3-layer model
+  vf3_threshold:      0.90
   checkpoint:         checkpoints/best_model.pt

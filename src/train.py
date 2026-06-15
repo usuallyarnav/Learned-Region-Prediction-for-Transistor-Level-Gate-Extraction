@@ -1,15 +1,3 @@
-"""
-train.py — Training Loop for CircuitFilterGNN
-
-Loads the pre-extracted .pt dataset from data/dataset/, splits into
-train/val/test, and trains the 3-layer RGCN model.
-
-pos_weight priority:
-  1. Explicit value in config.yaml training.pos_weight  → used directly
-  2. Not set / None                                      → computed dynamically
-     as (num_negatives / num_positives) from the actual dataset
-"""
-
 import os
 import sys
 import random
@@ -21,17 +9,11 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data, Batch
 
-# ── Project layout ────────────────────────────────────────────────────────────
-_SRC_DIR     = Path(__file__).resolve().parent          # .../circuit_gnn_project/src
-_PROJECT_DIR = _SRC_DIR.parent                          # .../circuit_gnn_project
+_SRC_DIR     = Path(__file__).resolve().parent
+_PROJECT_DIR = _SRC_DIR.parent
 
 sys.path.insert(0, str(_SRC_DIR))
-from model import CircuitFilterGNN, CHECKPOINTS_DIR     # noqa: E402
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Config Loading
-# ─────────────────────────────────────────────────────────────────────────────
+from model import CircuitFilterGNN, CHECKPOINTS_DIR
 
 def load_config(cfg_path: Path) -> dict:
     if not cfg_path.is_file():
@@ -40,32 +22,18 @@ def load_config(cfg_path: Path) -> dict:
     with open(cfg_path) as f:
         return yaml.safe_load(f)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Dataset Loading & Splitting
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _clean_graph(g, keep_label: bool):
-    """
-    Strip a PyG Data down to the tensors the model/batcher need. Non-tensor attrs
-    (strings like target_name, dicts from the parser) break Batch.from_data_list,
-    so we rebuild a minimal Data with only x / edge_index / edge_type (+ y).
-    """
+
     d = Data(x=g.x, edge_index=g.edge_index, edge_type=g.edge_type)
     d.num_nodes = g.num_nodes
     if keep_label:
         d.y = g.y.view(1).float()
     return d
 
-
 def load_targets(targets_dir: Path) -> dict:
-    """
-    Load the target gate graphs (one .json per gate, produced by
-    `parser.py --library`). Returns {target_name: clean target Data}.
-    The same shared GNN embeds these every step, so they are kept tiny/clean.
-    """
+
     sys.path.insert(0, str(_SRC_DIR))
-    from extractor import _build_full_graph, _load_json  # noqa: E402
+    from extractor import _build_full_graph, _load_json
 
     files = sorted(targets_dir.glob("*.json"))
     if not files:
@@ -78,12 +46,8 @@ def load_targets(targets_dir: Path) -> dict:
         targets[f.stem] = _clean_graph(_build_full_graph(_load_json(f)), keep_label=False)
     return targets
 
-
 def load_all_pt_files(dataset_dir: Path) -> list:
-    """
-    Load all candidate .pt samples. Each must carry .y and .target_name (written by
-    the target-conditioned extractor). Returns a list of (clean_candidate, target_name).
-    """
+
     pt_files = sorted(dataset_dir.glob("*.pt"))
     if not pt_files:
         print(f"[ERROR] No .pt files found in {dataset_dir}")
@@ -112,13 +76,8 @@ def load_all_pt_files(dataset_dir: Path) -> list:
         sys.exit(1)
     return samples
 
-
 class PairDataset(Dataset):
-    """
-    Yields (candidate_graph, target_graph) pairs. The candidate carries the label
-    (.y); the target is looked up by the candidate's target_name from a shared dict
-    so we store each gate graph once rather than on every sample.
-    """
+
     def __init__(self, samples, targets):
         self.samples = samples
         self.targets = targets
@@ -130,12 +89,10 @@ class PairDataset(Dataset):
         cand, tname = self.samples[i]
         return cand, self.targets[tname]
 
-
 def collate_pairs(batch):
-    """Batch candidates and their targets into two aligned PyG Batches."""
+
     cands, tgts = zip(*batch)
     return Batch.from_data_list(list(cands)), Batch.from_data_list(list(tgts))
-
 
 def split_dataset(
     graphs: list[Data],
@@ -143,10 +100,7 @@ def split_dataset(
     val_frac: float,
     seed: int,
 ) -> tuple[list[Data], list[Data], list[Data]]:
-    """
-    Splits graphs into train/val/test with reproducible shuffling.
-    test_frac = 1.0 - train_frac - val_frac (remainder).
-    """
+
     random.seed(seed)
     shuffled = graphs.copy()
     random.shuffle(shuffled)
@@ -161,23 +115,12 @@ def split_dataset(
 
     return train_set, val_set, test_set
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  pos_weight Resolution
-# ─────────────────────────────────────────────────────────────────────────────
-
 def resolve_pos_weight(
-    cfg_value,                  # value from config (int/float or None)
+    cfg_value,
     train_graphs: list[Data],
     device: torch.device,
 ) -> torch.Tensor:
-    """
-    Priority:
-      1. cfg_value is not None → use it directly
-      2. cfg_value is None    → compute dynamically from training labels
 
-    Dynamic computation uses training split only to avoid data leakage.
-    """
     if cfg_value is not None:
         w = float(cfg_value)
         print(f"  pos_weight        : {w:.2f}  (from config)")
@@ -194,24 +137,8 @@ def resolve_pos_weight(
     print(f"  pos_weight        : {w:.2f}  (dynamic: {num_neg} neg / {num_pos} pos)")
     return torch.tensor([w], device=device)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Learning-rate schedule (anti-plateau)
-# ─────────────────────────────────────────────────────────────────────────────
-#  Rationale: a constant LR held for 1000 epochs is the usual cause of the flat
-#  loss / flat val_f1 plateaus in this pipeline. Once the optimiser settles into a
-#  basin, it has no mechanism to refine the decision boundary that separates the
-#  hard negatives (Partial / Mutation) from positives. ReduceLROnPlateau cuts the
-#  LR whenever val_f1 stalls, which lets the model keep sharpening that boundary.
-#
-#  This changes NOTHING about the modelling strategy — it is still the paper's
-#  RGCN + BCEWithLogitsLoss. Only the LR trajectory and the stopping rule change.
-
 def build_scheduler(optimizer, sch_cfg: dict):
-    """
-    Returns a ReduceLROnPlateau scheduler (mode='max', tracks val_f1) or None
-    when disabled in config. Kept deliberately simple and version-portable.
-    """
+
     if not sch_cfg or not sch_cfg.get("enabled", False):
         return None
 
@@ -221,38 +148,22 @@ def build_scheduler(optimizer, sch_cfg: dict):
 
     return torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode      = "max",                              # maximise val_f1
+        mode      = "max",
         factor    = float(sch_cfg.get("factor",   0.5)),
         patience  = int(sch_cfg.get("patience",   15)),
         min_lr    = float(sch_cfg.get("min_lr",   1e-5)),
         threshold = float(sch_cfg.get("threshold", 1e-3)),
     )
 
-
 def warmup_lr_factor(epoch: int, warmup_epochs: int) -> float:
-    """
-    Linear LR warmup multiplier in [0, 1]. epoch is 1-indexed.
-    Returns 1.0 once warmup is complete (or when warmup is disabled).
-    A short warmup keeps the first few BatchNorm/RGCN updates from destabilising
-    the run, which otherwise shows up as an early plateau the model never leaves.
-    """
+
     if warmup_epochs and warmup_epochs > 0 and epoch <= warmup_epochs:
         return epoch / float(warmup_epochs)
     return 1.0
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Evaluation
-# ─────────────────────────────────────────────────────────────────────────────
-
 @torch.no_grad()
 def evaluate(model, loader, criterion, device) -> tuple:
-    """
-    Returns (loss, accuracy, precision, recall, f1).
-    Recall = fraction of true gate-regions the filter keeps — this is the number
-    that tells you whether gates will be MISSED downstream. F1 uses threshold=0.5;
-    use vf3_threshold (config) only at inference.
-    """
+
     model.eval()
     total_loss = 0.0
     tp = fp = fn = tn = 0
@@ -285,11 +196,6 @@ def evaluate(model, loader, criterion, device) -> tuple:
     model.train()
     return avg_loss, acc, prec, rec, f1
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Main Training Loop
-# ─────────────────────────────────────────────────────────────────────────────
-
 def train(cfg_path: Path) -> None:
     cfg      = load_config(cfg_path)
     dat_cfg  = cfg.get("data",     {})
@@ -297,10 +203,8 @@ def train(cfg_path: Path) -> None:
     trn_cfg  = cfg.get("training", {})
     ext_cfg  = cfg.get("extractor", {})
 
-    # ── Device ───────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Dataset ───────────────────────────────────────────────────────────────
     dataset_dir = _PROJECT_DIR / dat_cfg.get("dataset_dir", "data/dataset")
     targets_dir = _PROJECT_DIR / dat_cfg.get("targets_dir", "data/parsed/targets")
 
@@ -322,7 +226,6 @@ def train(cfg_path: Path) -> None:
     test_loader  = DataLoader(PairDataset(test_graphs, targets),  batch_size=batch_size,
                               shuffle=False, collate_fn=collate_pairs)
 
-    # ── Model ─────────────────────────────────────────────────────────────────
     model = CircuitFilterGNN(
         in_channels     = mdl_cfg.get("in_channels",     5),
         hidden_channels = mdl_cfg.get("hidden_channels", 128),
@@ -331,7 +234,6 @@ def train(cfg_path: Path) -> None:
         num_layers      = mdl_cfg.get("num_layers",       2),
     ).to(device)
 
-    # ── Loss ──────────────────────────────────────────────────────────────────
     pos_weight = resolve_pos_weight(
         cfg_value    = trn_cfg.get("pos_weight", None),
         train_graphs = train_graphs,
@@ -339,7 +241,6 @@ def train(cfg_path: Path) -> None:
     )
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # ── Optimiser ─────────────────────────────────────────────────────────────
     base_lr   = trn_cfg.get("learning_rate", 0.001)
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -347,7 +248,6 @@ def train(cfg_path: Path) -> None:
         weight_decay = trn_cfg.get("weight_decay",  0.0001),
     )
 
-    # ── Anti-plateau schedule ───────────────────────────────────────────────
     scheduler     = build_scheduler(optimizer, trn_cfg.get("scheduler", {}))
     warmup_epochs = int(trn_cfg.get("warmup_epochs", 0) or 0)
 
@@ -363,23 +263,16 @@ def train(cfg_path: Path) -> None:
     es_min_delta    = float(es_cfg.get("min_delta", 0.0005))
     epochs_no_improve = 0
 
-    # ── Checkpointing ─────────────────────────────────────────────────────────
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
     best_ckpt  = CHECKPOINTS_DIR / "best_model.pt"
     best_val_f1 = 0.0
 
-    # Which validation metric drives best-checkpoint / scheduler / early-stop.
-    # "f1" (default) balances precision+recall. "recall" picks the model that
-    # misses the fewest true gate-regions — use it if downstream is missing gates
-    # (the exact VF3 verifier removes any false positives the filter lets through,
-    # so over-keeping is cheap; under-keeping loses gates permanently).
     checkpoint_metric = str(trn_cfg.get("checkpoint_metric", "f1")).lower()
     if checkpoint_metric not in ("f1", "recall"):
         print(f"[WARN] Unknown checkpoint_metric '{checkpoint_metric}' — using 'f1'")
         checkpoint_metric = "f1"
     best_val_score = 0.0
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_train_pos = sum(1 for cand, _ in train_graphs if cand.y.item() == 1)
     n_train_neg = sum(1 for cand, _ in train_graphs if cand.y.item() == 0)
@@ -409,8 +302,7 @@ def train(cfg_path: Path) -> None:
     model.train()
 
     for epoch in range(1, epochs + 1):
-        # Linear LR warmup for the first `warmup_epochs` epochs. After warmup the
-        # plateau scheduler takes over (it reads the post-warmup LR as its baseline).
+
         if warmup_epochs > 0 and epoch <= warmup_epochs:
             wf = warmup_lr_factor(epoch, warmup_epochs)
             for pg in optimizer.param_groups:
@@ -436,7 +328,6 @@ def train(cfg_path: Path) -> None:
         val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(model, val_loader, criterion, device)
         val_score = val_rec if checkpoint_metric == "recall" else val_f1
 
-        # Checkpoint + improvement tracking on the chosen metric.
         improved = val_score > (best_val_score + es_min_delta)
         if val_score > best_val_score:
             best_val_score = val_score
@@ -455,7 +346,6 @@ def train(cfg_path: Path) -> None:
         else:
             ckpt_marker = ""
 
-        # Plateau scheduler steps on the chosen metric, after warmup.
         if scheduler is not None and epoch > warmup_epochs:
             scheduler.step(val_score)
 
@@ -472,7 +362,6 @@ def train(cfg_path: Path) -> None:
             f"{ckpt_marker}"
         )
 
-        # Early stopping — counts epochs without a meaningful val_f1 gain.
         if es_enabled and epoch > warmup_epochs:
             if improved:
                 epochs_no_improve = 0
@@ -486,7 +375,6 @@ def train(cfg_path: Path) -> None:
                     )
                     break
 
-    # ── Final Test Evaluation ─────────────────────────────────────────────────
     print(f"\n{sep}")
     print(f"  Final Test Evaluation (best checkpoint)")
     print(sep)
@@ -509,7 +397,6 @@ def train(cfg_path: Path) -> None:
     print(f"  Test recall       : {test_rec:.4f}   (← gates kept; 1.0 = none missed)")
     print(f"  Test F1           : {test_f1:.4f}")
     print(f"{sep}\n")
-
 
 if __name__ == "__main__":
     import argparse
