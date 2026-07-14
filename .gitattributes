@@ -1,3 +1,5 @@
 vf3_cpp/** linguist-vendored
-data/vf3_out/** linguist-generated
-*.v linguist-language=Verilog
+data/** linguist-generated
+outputs/** linguist-generated
+*.sp linguist-detectable=false
+*.v linguist-detectable=false
