@@ -1,0 +1,3 @@
+vf3_cpp/** linguist-vendored
+data/vf3_out/** linguist-generated
+*.v linguist-language=Verilog
