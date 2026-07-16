@@ -324,7 +324,7 @@ The 9.1 s baseline is *single-cell* VF3 — the crippled configuration from Wall
 | GNN screen + VF3 confirm | 7.8 s | Only the XNR4s |
 | Single-cell VF3 (the flattering baseline) | 9.1 s | Only the XNR4s |
 
-**Full VF3 is ~12× faster than our method and returns strictly more information.** Leafy's hierarchical matcher is reported faster still (~0.024 s).
+**Full VF3 is ~12× faster than our method and returns strictly more information.** our hierarchical matcher is reported faster still (~0.024 s).
 
 **The root cause, stated plainly:** the screener has a **fixed cost** — it must look at the whole chip once, no matter what. On these netlists that fixed cost (≈8 s, or ≈2 s with further optimisation) is *larger than the entire matching problem it is trying to accelerate* (0.62 s).
 
