@@ -2,7 +2,7 @@
 
 **A GNN-based screener that narrows exact subgraph matching — plus an honest, measured account of when that helps and when it doesn't.**
 
-This project reproduces and stress-tests the approach of Seo et al., *"Target Circuit Matching in Large-Scale Netlists Using GNN-Based Region Prediction"* (arXiv:2507.19518, 2025): train a graph neural network to predict *where* a target logic gate lives in a transistor-level netlist, then let an exact subgraph-isomorphism matcher (VF3) confirm only those regions.
+This project reproduces and stress-tests and improvises the approach of Seo et al., *"Target Circuit Matching in Large-Scale Netlists Using GNN-Based Region Prediction"* (arXiv:2507.19518, 2025): train a graph neural network to predict *where* a target logic gate lives in a transistor-level netlist, then let an exact subgraph-isomorphism matcher (VF3) confirm only those regions.
 
 The pipeline works end to end and is provably correct. What makes this repository worth reading, though, is the second half: **a rigorous, reproducible investigation into whether learned pruning actually beats a fast exact matcher on standard benchmark netlists — and the finding that, at this scale, it does not.** Every claim below is backed by a command you can run.
 
