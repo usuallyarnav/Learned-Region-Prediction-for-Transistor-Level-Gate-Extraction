@@ -446,7 +446,7 @@ Secondary items: implement the `VDD`/`GND` special-case (≈8 s → ≈2 s); emi
 
 **Method reproduced:**
 Seo, Seo, Lee, Kim, Shin, Sung, Park. *Target Circuit Matching in Large-Scale Netlists Using GNN-Based Region Prediction.* arXiv:2507.19518, 2025.
-
+(improvised through bfs verification) 
 **Exact matcher:**
 Carletti, Foggia, Saggese, Vento. *Introducing VF3: A New Algorithm for Subgraph Isomorphism.* GbRPR 2017. (Parallel C++ implementation vendored in `vf3_cpp/`.)
 
