@@ -8,7 +8,6 @@ This repository reproduces the method of **Seo et al., *Target Circuit Matching 
 <img alt="Python" src="https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white">
 <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?logo=pytorch&logoColor=white">
 <img alt="PyG" src="https://img.shields.io/badge/PyTorch_Geometric-2.3+-3C2179">
-<img alt="C++20" src="https://img.shields.io/badge/C++20-OpenMP-00599C?logo=cplusplus&logoColor=white">
 <img alt="CUDA" src="https://img.shields.io/badge/CUDA-sparse_ops-76B900?logo=nvidia&logoColor=white">
 <img alt="License" src="https://img.shields.io/badge/License-MIT-green">
 </p>
